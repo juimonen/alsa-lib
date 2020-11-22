@@ -94,12 +94,14 @@ struct snd_tplg {
 	struct list_head pcm_config_list;
 	struct list_head pcm_caps_list;
 	struct list_head hw_cfg_list;
+	struct list_head class_list;
 
 	/* type-specific control lists */
 	struct list_head mixer_list;
 	struct list_head enum_list;
 	struct list_head bytes_ext_list;
 };
+
 
 /* object text references */
 struct tplg_ref {
@@ -138,6 +140,8 @@ struct tplg_tuple {
 struct tplg_tuple_set {
 	unsigned int  type; /* uuid, bool, byte, short, word, string*/
 	unsigned int  num_tuples;
+	char token_ref[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
+	struct list_head list; /* item in tuple_set_list */
 	struct tplg_tuple tuple[0];
 };
 
@@ -182,6 +186,7 @@ struct tplg_elem {
 		struct snd_soc_tplg_private *data;
 		struct tplg_vendor_tokens *tokens;
 		struct tplg_vendor_tuples *tuples;
+		struct tplg_comp_class *comp_class;
 		struct snd_soc_tplg_manifest *manifest;
 	};
 
@@ -288,7 +293,6 @@ int tplg_parse_dai(snd_tplg_t *tplg, snd_config_t *cfg, void *priv);
 int tplg_parse_link(snd_tplg_t *tplg, snd_config_t *cfg, void *priv);
 int tplg_parse_cc(snd_tplg_t *tplg, snd_config_t *cfg, void *priv);
 int tplg_parse_hw_config(snd_tplg_t *tplg, snd_config_t *cfg, void *priv);
-
 unsigned int tplg_get_tuple_size(int type);
 void tplg_free_tuples(void *obj);
 
