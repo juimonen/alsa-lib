@@ -95,6 +95,7 @@ struct snd_tplg {
 	struct list_head pcm_caps_list;
 	struct list_head hw_cfg_list;
 	struct list_head class_list;
+	struct list_head object_list;
 
 	/* type-specific control lists */
 	struct list_head mixer_list;
@@ -186,8 +187,9 @@ struct tplg_elem {
 		struct snd_soc_tplg_private *data;
 		struct tplg_vendor_tokens *tokens;
 		struct tplg_vendor_tuples *tuples;
-		struct tplg_comp_class *comp_class;
 		struct snd_soc_tplg_manifest *manifest;
+		struct tplg_class *class;
+		struct tplg_object *object;
 	};
 
 	/* an element may refer to other elements:
@@ -470,6 +472,7 @@ int get_tuple_type(const char *name);
 int parse_tuple_value(snd_config_t *n, struct tplg_tuple *tuple, int type);
 int get_token_value(const char *token_id, struct tplg_vendor_tokens *tokens);
 struct tplg_elem *tplg_elem_new_route(snd_tplg_t *tplg, int index);
+void tplg2_print_elems(snd_tplg_t *tplg);
 int tplg_set_hw_config(snd_config_t *cfg, struct snd_soc_tplg_hw_config *hw_cfg);
 int tplg_parse_link_param(snd_tplg_t *tplg, snd_config_t *n,
 			  struct snd_soc_tplg_link_config *link, struct tplg_elem *elem);

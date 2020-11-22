@@ -574,6 +574,7 @@ static bool has_tuples(struct tplg_elem *elem)
 /* get size of a tuple element from its type */
 unsigned int tplg_get_tuple_size(int type)
 {
+
 	switch (type) {
 
 	case SND_SOC_TPLG_TUPLE_TYPE_UUID:

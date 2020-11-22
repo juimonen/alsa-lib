@@ -30,7 +30,8 @@ libatopology_la_SOURCES =\
 	elem.c \
 	save.c \
 	decoder.c \
-	log.c
+	log.c \
+	class.c
 
 noinst_HEADERS = tplg_local.h
 
