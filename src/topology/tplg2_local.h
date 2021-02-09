@@ -92,6 +92,7 @@ struct tplg_class {
 	int num_args;
 	struct list_head attribute_list;
 	struct list_head object_list;
+	struct list_head ref_object_list; /* for objects that we don't know the final class type yet */
 	int type;
 };
 

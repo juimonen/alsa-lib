@@ -545,6 +545,7 @@ static struct tplg_elem *tplg_class_elem(snd_tplg_t *tplg, snd_config_t *cfg, in
 	snd_strlcpy(class->name, id, SNDRV_CTL_ELEM_ID_NAME_MAXLEN);
 	INIT_LIST_HEAD(&class->attribute_list);
 	INIT_LIST_HEAD(&class->object_list);
+	INIT_LIST_HEAD(&class->ref_object_list);
 	elem->class = class;
 
 	return elem;
@@ -634,13 +635,29 @@ static int tplg_create_child_objects(snd_tplg_t *tplg, snd_config_t *cfg,
 {
 	snd_config_iterator_t i, next;
 	struct tplg_elem *class_elem;
+	struct list_head *pos;
 	snd_config_t *n;
 	const char *id;
 	int ret;
 
 	snd_config_for_each(i, next, cfg) {
+		bool found = false;
+
 		n = snd_config_iterator_entry(i);
 		if (snd_config_get_id(n, &id) < 0)
+			continue;
+
+		/* check if it is an attribute, if so skip */
+		list_for_each(pos, &parent->attribute_list) {
+			struct tplg_attribute *attr = list_entry(pos, struct tplg_attribute, list);
+
+			if (!strcmp(attr->name, id)) {
+				found = true;
+				break;
+			}
+		}
+
+		if (found)
 			continue;
 
 		/* check if it is an object */
@@ -1037,15 +1054,22 @@ static int tplg_create_widget_elem(snd_tplg_t *tplg, struct tplg_object *object)
 	struct tplg_comp_object *widget_object = &object->object_type.component;
 	struct tplg_elem *widget_elem, *data_elem;
 	struct snd_soc_tplg_dapm_widget *widget;
+	char *class_name = object->class_name;
+	char *elem_name;
 	int ret;
 
-	widget_elem = tplg_elem_new_common(tplg, NULL, object->name,
-					   SND_TPLG_TYPE_DAPM_WIDGET);
+	if (strcmp(class_name, "virtual_widget"))
+		elem_name = object->name;
+	else
+		elem_name = strchr(object->name, '.') + 1;
+
+	widget_elem = tplg_elem_new_common(tplg, NULL, elem_name,
+						   SND_TPLG_TYPE_DAPM_WIDGET);
 	if (!widget_elem)
 		return -ENOMEM;
 
 	/* create data elem for w */
-	data_elem = tplg_elem_new_common(tplg, NULL, object->name, SND_TPLG_TYPE_DATA);
+	data_elem = tplg_elem_new_common(tplg, NULL, elem_name, SND_TPLG_TYPE_DATA);
         if (!data_elem)
                 return -ENOMEM;
 
@@ -1068,8 +1092,47 @@ static int tplg_create_widget_elem(snd_tplg_t *tplg, struct tplg_object *object)
 static int tplg_copy_child_objects(snd_tplg_t *tplg, struct tplg_class *class,
 				  struct tplg_object *object)
 {
-	struct list_head *pos;
+	struct list_head *pos, *pos1;
 	int ret;
+
+	/* reference objects are not created when the class is created. So create them now. */
+	list_for_each(pos, &class->ref_object_list) {
+		struct tplg_object *obj = list_entry(pos, struct tplg_object, list);
+		struct tplg_object *new_obj = calloc(1, sizeof(*obj));
+		struct tplg_elem *class_elem;
+		char *class_name = NULL;
+		const char *id;
+
+		new_obj->cfg = obj->cfg;
+
+		if (snd_config_get_id(new_obj->cfg, &id) < 0)
+			continue;
+
+		/* get class name from parent attribute list */
+		list_for_each(pos1, &object->attribute_list) {
+			struct tplg_attribute *attr =  list_entry(pos1, struct tplg_attribute, list);
+
+			if (!strcmp(attr->name, id + 1)) {
+				class_name = attr->value.string;
+				break;
+			}
+		}
+
+		if (!class_name)
+			continue;
+
+		class_elem = tplg_elem_lookup(&tplg->class_list, class_name,
+					      SND_TPLG_TYPE_CLASS, SND_TPLG_INDEX_ALL);
+		if (!class_elem)
+			continue;
+
+		ret = tplg_create_child_object(tplg, new_obj->cfg, class_elem, object,
+						  &object->object_list);
+		if (ret < 0) {
+			SNDERR("Error creating object type %s\n", class_elem->id);
+			return ret;
+		}
+	}
 
 	/* copy child objects */
 	list_for_each(pos, &class->object_list) {
@@ -1275,10 +1338,13 @@ static int tplg_create_component_object(struct tplg_object *object)
 	case SND_SOC_TPLG_DAPM_PGA:
 	case SND_SOC_TPLG_DAPM_BUFFER:
 	case SND_SOC_TPLG_DAPM_SCHEDULER:
+	case SND_SOC_TPLG_DAPM_EFFECT:
 	case SND_SOC_TPLG_DAPM_AIF_IN:
 	case SND_SOC_TPLG_DAPM_AIF_OUT:
 	case SND_SOC_TPLG_DAPM_DAI_OUT:
 	case SND_SOC_TPLG_DAPM_DAI_IN:
+	case SND_SOC_TPLG_DAPM_INPUT:
+	case SND_SOC_TPLG_DAPM_OUT_DRV:
 		comp->widget_id = widget_id;
 		break;
 	default:
@@ -1305,7 +1371,7 @@ tplg_create_object(snd_tplg_t *tplg, snd_config_t *cfg, struct tplg_class *class
 		return NULL;
 	}
 
-	/* get class name */
+	/* get object arguments */
 	if (snd_config_get_id(cfg, &name) < 0) {
 		SNDERR("Invalid name for widget\n");
 		return NULL;
@@ -1339,7 +1405,6 @@ tplg_create_object(snd_tplg_t *tplg, snd_config_t *cfg, struct tplg_class *class
 	free(object_name);
 
 	/* copy attributes from class */
-
 	list_for_each(pos, &class->attribute_list) {
 		struct tplg_attribute *attr = list_entry(pos, struct tplg_attribute, list);
 		struct tplg_attribute *new_attr = calloc(1, sizeof(*attr));
@@ -1397,20 +1462,20 @@ tplg_create_object(snd_tplg_t *tplg, snd_config_t *cfg, struct tplg_class *class
 		break;
 	}
 
-	/* now copy child objects */
-	if (object->type != SND_TPLG_CLASS_TYPE_DAI) {
-		ret = tplg_copy_child_objects(tplg, class, object);
-		if (ret < 0) {
-			SNDERR("Failed to create DAI object for %s\n", object->name);
-			return NULL;
-		}
-	}
-
 	/* update attribute and arguments values from parent args */
 	if (parent) {
 		ret = tplg_update_attributes_from_parent(object, parent);
 		if (ret < 0) {
 			SNDERR("failed to update attributes for %s\n", object->name);
+			return NULL;
+		}
+	}
+
+	/* now copy child objects */
+	if (object->type != SND_TPLG_CLASS_TYPE_DAI) {
+		ret = tplg_copy_child_objects(tplg, class, object);
+		if (ret < 0) {
+			SNDERR("Failed to create DAI object for %s\n", object->name);
 			return NULL;
 		}
 	}
@@ -1492,7 +1557,7 @@ static int tplg_get_object_tuple_set(struct tplg_object *object, struct tplg_tup
 			list_del(&set->list);
 
 			set = set2;
-			list_add(&set->list, &object->tuple_set_list);
+			list_add_tail(&set->list, &object->tuple_set_list);
 			*out = set;
 			return 0;
 		}
@@ -1504,7 +1569,7 @@ static int tplg_get_object_tuple_set(struct tplg_object *object, struct tplg_tup
 	set->num_tuples = 1;
 	set->type = set_type;
 	snd_strlcpy(set->token_ref, tokenref_str, SNDRV_CTL_ELEM_ID_NAME_MAXLEN);
-	list_add(&set->list, &object->tuple_set_list);
+	list_add_tail(&set->list, &object->tuple_set_list);
 	*out = set;
 
 	return 0;
@@ -1620,7 +1685,7 @@ static int tplg_build_object_tuple_set_from_attributes(struct tplg_object *objec
 static int tplg_build_object_tuple_sets(struct tplg_object *object)
 {
 	struct list_head *pos;
-	int ret;
+	int ret = 0;
 
 	list_for_each(pos, &object->attribute_list) {
 		struct tplg_attribute *attr = list_entry(pos, struct tplg_attribute, list);
@@ -1699,7 +1764,7 @@ static int tplg_build_dai_object(snd_tplg_t *tplg, struct tplg_object *object)
 	struct tplg_dai_object *dai = &object->object_type.dai;
 	struct snd_soc_tplg_link_config *link;
 	struct tplg_elem *l_elem;
-	struct list_head *pos;
+	struct list_head *pos, *_pos;
 	int i = 0;
 	int ret;
 
@@ -1744,6 +1809,20 @@ static int tplg_build_dai_object(snd_tplg_t *tplg, struct tplg_object *object)
 			}
 			tplg_dbg("HW Config: %d", hw_cfg->id);
 		}
+
+		if (!strcmp(child->class_name, "pdm_config")) {
+			/* build tuple sets for pdm_config object */
+			ret = tplg_build_object_tuple_sets(child);
+			if (ret < 0)
+				return ret;
+
+			list_for_each_safe(pos1, _pos, &child->tuple_set_list) {
+				struct tplg_tuple_set *set;
+				set = list_entry(pos1, struct tplg_tuple_set, list);
+				list_del(&set->list);
+				list_add_tail(&set->list, &object->tuple_set_list);
+			}
+		}
 	}
 
 	/* parse link params from attributes */
@@ -1782,6 +1861,7 @@ static int tplg2_parse_channel(struct tplg_object *object, struct tplg_elem *mix
 
 	channel += mc->num_channels;
 
+	channel->id = channel_id;
 	channel->size = sizeof(*channel);
 	list_for_each(pos, &object->attribute_list) {
 		struct tplg_attribute *attr = list_entry(pos, struct tplg_attribute, list);
@@ -1800,7 +1880,7 @@ static int tplg2_parse_channel(struct tplg_object *object, struct tplg_elem *mix
 		return -EINVAL;
 	}
 
-	tplg_dbg("channel: %s reg:%d shift %d", channel_name, channel->reg, channel->shift);
+	tplg_dbg("channel: %s id: %d reg:%d shift %d", channel_name, channel->id, channel->reg, channel->shift);
 
 	return 0;
 }
@@ -1817,8 +1897,11 @@ static int tplg2_parse_tlv(snd_tplg_t *tplg, struct tplg_object *object,
 	/* Just add ref is TLV elem exists already */
 	elem = tplg_elem_lookup(&tplg->widget_list, object->name, SND_TPLG_TYPE_TLV,
 				SND_TPLG_INDEX_ALL);
-	if (elem)
+	if (elem) {
+		tplg_tlv = elem->tlv;
+		scale = &tplg_tlv->scale;
 		goto ref;
+	}
 
 	/* otherwise create new tlv elem */
 	elem = tplg_elem_new_common(tplg, NULL, object->name, SND_TPLG_TYPE_TLV);
@@ -1829,8 +1912,6 @@ static int tplg2_parse_tlv(snd_tplg_t *tplg, struct tplg_object *object,
 	tplg_tlv->size = sizeof(struct snd_soc_tplg_ctl_tlv);
 	tplg_tlv->type = SNDRV_CTL_TLVT_DB_SCALE;
 	scale = &tplg_tlv->scale;
-
-	tplg_dbg("TLV: %s", elem->id);
 
 	list_for_each(pos, &object->object_list) {
 		struct tplg_object *child = list_entry(pos, struct tplg_object, list);
@@ -1854,6 +1935,8 @@ static int tplg2_parse_tlv(snd_tplg_t *tplg, struct tplg_object *object,
 		}
 	}
 ref:
+	tplg_dbg("TLV: %s scale min: %d step %d mute %d", elem->id, scale->min, scale->step, scale->mute);
+
 	ret = tplg_ref_add(mixer_elem, SND_TPLG_TYPE_TLV, elem->id);
 	if (ret < 0) {
 		SNDERR("failed to add tlv elem %s to mixer elem %s\n",
@@ -1868,12 +1951,14 @@ static struct tplg_elem *tplg_build_comp_mixer(snd_tplg_t *tplg, struct tplg_obj
 {
 	struct snd_soc_tplg_mixer_control *mc;
 	struct snd_soc_tplg_ctl_hdr *hdr;
+	struct tplg_attribute *name;
 	struct tplg_elem *elem;
 	struct list_head *pos;
 	bool access_set = false, tlv_set = false;
 	int j, ret;
 
-	elem = tplg_elem_new_common(tplg, NULL, object->name, SND_TPLG_TYPE_MIXER);
+	name = tplg_get_attribute_by_name(&object->attribute_list, "name");
+	elem = tplg_elem_new_common(tplg, NULL, name->value.string, SND_TPLG_TYPE_MIXER);
 	if (!elem)
 		return NULL;
 
@@ -1887,8 +1972,6 @@ static struct tplg_elem *tplg_build_comp_mixer(snd_tplg_t *tplg, struct tplg_obj
 	/* set channel reg to default state */
 	for (j = 0; j < SND_SOC_TPLG_MAX_CHAN; j++)
 		mc->channel[j].reg = -1;
-
-	tplg_dbg("Mixer: %s", elem->id);
 
 	/* parse some control params from attributes */
 	list_for_each(pos, &object->attribute_list) {
@@ -1910,9 +1993,8 @@ static struct tplg_elem *tplg_build_comp_mixer(snd_tplg_t *tplg, struct tplg_obj
 			if (ret < 0) {
 				SNDERR("Error parsing access attribute for %s\n", object->name);
 				return NULL;
-			} else  {
-				access_set = true;
 			}
+			access_set = true;
 		}
 
 	}
@@ -1938,9 +2020,8 @@ static struct tplg_elem *tplg_build_comp_mixer(snd_tplg_t *tplg, struct tplg_obj
 			if (ret < 0) {
 				SNDERR("Error parsing tlv for mixer %s\n", object->name);
 				return NULL;
-			} else {
-				tlv_set = true;
 			}
+			tlv_set = true;
 			continue;
 		}
 
@@ -1954,14 +2035,130 @@ static struct tplg_elem *tplg_build_comp_mixer(snd_tplg_t *tplg, struct tplg_obj
 			continue;
 		}
 	}
-
-	tplg_dbg("Ops info: %d get: %d put: %d", hdr->ops.info, hdr->ops.get, hdr->ops.put);
+	tplg_dbg("Mixer: %s, num_channels: %d", elem->id, mc->num_channels);
+	tplg_dbg("Ops info: %d get: %d put: %d max: %d", hdr->ops.info, hdr->ops.get, hdr->ops.put, mc->max);
 
 	/* set CTL access to default values if none are provided */
 	if (!access_set) {
 		mc->hdr.access = SNDRV_CTL_ELEM_ACCESS_READWRITE;
 		if (tlv_set)
 			mc->hdr.access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ;
+	}
+
+	return elem;
+}
+
+static struct tplg_elem *tplg_build_comp_bytes(snd_tplg_t *tplg, struct tplg_object *object)
+{
+	struct snd_soc_tplg_bytes_control *be;
+	struct snd_soc_tplg_ctl_hdr *hdr;
+	struct tplg_elem *elem;
+	struct list_head *pos;
+	bool access_set = false, tlv_set = false;
+	char *name = strchr(object->name, '.') + 1;
+	char bytes_data_name[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
+	int ret;
+
+	snprintf(bytes_data_name, SNDRV_CTL_ELEM_ID_NAME_MAXLEN, "%s.%s",
+		  "data", name);
+
+	elem = tplg_elem_new_common(tplg, NULL, object->name, SND_TPLG_TYPE_BYTES);
+	if (!elem)
+		return NULL;
+
+	/* init new byte control */
+	be = elem->bytes_ext;
+	snd_strlcpy(be->hdr.name, elem->id, SNDRV_CTL_ELEM_ID_NAME_MAXLEN);
+	be->hdr.type = SND_SOC_TPLG_TYPE_BYTES;
+	be->size = elem->size;
+	hdr = &be->hdr;
+
+	/* parse some control params from attributes */
+	list_for_each(pos, &object->attribute_list) {
+		struct tplg_attribute *attr;
+
+		attr = list_entry(pos, struct tplg_attribute, list);
+
+		if (!attr->cfg)
+			continue;
+
+		ret = tplg_parse_control_bytes_param(tplg, attr->cfg, be, elem);
+		if (ret < 0) {
+			SNDERR("Error parsing control bytes params for %s\n", object->name);
+			return NULL;
+		}
+
+		if (!strcmp(attr->name, "access")) {
+			ret = parse_access_values(attr->cfg, &be->hdr);
+			if (ret < 0) {
+				SNDERR("Error parsing access attribute for %s\n", object->name);
+				return NULL;
+			} else  {
+				access_set = true;
+			}
+		}
+
+	}
+
+	/* parse the rest from child objects */
+	list_for_each(pos, &object->object_list) {
+		struct tplg_object *child = list_entry(pos, struct tplg_object, list);
+
+		if (!object->cfg)
+			continue;
+
+		if (!strcmp(child->class_name, "ops")) {
+			ret = tplg_parse_ops(tplg, child->cfg, &be->hdr);
+			if (ret < 0) {
+				SNDERR("Error parsing ops for mixer %s\n", object->name);
+				return NULL;
+			}
+			continue;
+		}
+
+		if (!strcmp(child->class_name, "tlv")) {
+			ret = tplg2_parse_tlv(tplg, child, elem);
+			if (ret < 0) {
+				SNDERR("Error parsing tlv for mixer %s\n", object->name);
+				return NULL;
+			} else {
+				tlv_set = true;
+			}
+			continue;
+		}
+
+		if (!strcmp(child->class_name, "extops")) {
+			ret = tplg_parse_ext_ops(tplg, child->cfg, &be->hdr);
+			if (ret < 0) {
+				SNDERR("Error parsing ext ops for bytes %s\n", object->name);
+				return NULL;
+			}
+			continue;
+		}
+
+		if (!strcmp(child->class_name, "data")) {
+			struct tplg_attribute *name;
+
+			name = tplg_get_attribute_by_name(&child->attribute_list, "name");
+			/* add reference to data elem */
+			ret = tplg_ref_add(elem, SND_TPLG_TYPE_DATA, name->value.string);
+			if (ret < 0) {
+				SNDERR("failed to add data elem %s to byte control %s\n",
+				       name->value.string, elem->id);
+				return NULL;
+			}
+		}
+	}
+
+	tplg_dbg("Bytes: %s Ops info: %d get: %d put: %d", elem->id, hdr->ops.info, hdr->ops.get,
+		 hdr->ops.put);
+	tplg_dbg("Ext Ops info: %d get: %d put: %d", be->ext_ops.info, be->ext_ops.get, be->ext_ops.put);
+
+	/* set CTL access to default values if none are provided */
+	if (!access_set) {
+		be->hdr.access = SNDRV_CTL_ELEM_ACCESS_READWRITE;
+		if (tlv_set)
+			be->hdr.access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ;
 	}
 
 	return elem;
@@ -2018,6 +2215,18 @@ static int tplg_build_comp_object(snd_tplg_t *tplg, struct tplg_object *object)
 		char *class_name = child->class_name;
 
 		if (!strcmp(class_name, "mixer")) {
+			struct tplg_attribute *name_attr;
+			char *name;
+
+			name_attr = tplg_get_attribute_by_name(&child->attribute_list, "name");
+			name = name_attr->value.string;
+			if (name[0] == '$')
+				continue;
+			/*
+			 * volume component has 2 mixers defined but not all volume components
+			 * define them. So build only the ones that are actually have properly
+			 * defined names.
+			 */
 			elem = tplg_build_comp_mixer(tplg, child);
 			if (!elem) {
 				SNDERR("Failed to build mixer control for %s\n", object->name);
@@ -2027,6 +2236,21 @@ static int tplg_build_comp_object(snd_tplg_t *tplg, struct tplg_object *object)
 			ret = tplg_ref_add(w_elem, SND_TPLG_TYPE_MIXER, elem->id);
 			if (ret < 0) {
 				SNDERR("failed to add mixer elem %s to widget elem %s\n",
+				       elem->id, w_elem->id);
+				return ret;
+			}
+		}
+
+		if (!strcmp(class_name, "bytes")) {
+			elem = tplg_build_comp_bytes(tplg, child);
+			if (!elem) {
+				SNDERR("Failed to build bytes control for %s\n", object->name);
+				return -EINVAL;
+			}
+
+			ret = tplg_ref_add(w_elem, SND_TPLG_TYPE_BYTES, elem->id);
+			if (ret < 0) {
+				SNDERR("failed to add bytes control elem %s to widget elem %s\n",
 				       elem->id, w_elem->id);
 				return ret;
 			}
@@ -2063,7 +2287,7 @@ static int tplg_pipeline_update_buffer_size(struct tplg_object *pipe_object,
 	int rate = 0;
 	int schedule_period = 0;
 
-	/* get periods from buffer object */
+	/* get periods and channels from buffer object */
 	list_for_each(pos, &object->attribute_list) {
 		struct tplg_attribute *attr = list_entry(pos, struct tplg_attribute, list);
 
@@ -2076,12 +2300,21 @@ static int tplg_pipeline_update_buffer_size(struct tplg_object *pipe_object,
 			}
 		}
 
+		if (!strcmp(attr->name, "channels")) {
+			if (attr->type == SND_CONFIG_TYPE_INTEGER) {
+				channels = attr->value.integer;
+			} else {
+				SNDERR("Invalid value for channels for object %s \n", pipe_object->name);
+				return -EINVAL;
+			}
+		}
+
 		if (!strcmp(attr->name, "size"))
 			size_attribute = attr;
 	}
 
 	if (!size_attribute) {
-		SNDERR("Can't fine size attribute for %s \n", object->name);
+		SNDERR("Can't find size attribute for %s \n", object->name);
 		return -EINVAL;
 	}
 
@@ -2094,15 +2327,6 @@ static int tplg_pipeline_update_buffer_size(struct tplg_object *pipe_object,
 				schedule_period = attr->value.integer;
 			} else {
 				SNDERR("Invalid value for period for object %s \n", pipe_object->name);
-				return -EINVAL;
-			}
-		}
-
-		if (!strcmp(attr->name, "channels")) {
-			if (attr->type == SND_CONFIG_TYPE_INTEGER) {
-				channels = attr->value.integer;
-			} else {
-				SNDERR("Invalid value for channels for object %s \n", pipe_object->name);
 				return -EINVAL;
 			}
 		}
@@ -2652,48 +2876,19 @@ static int tplg_build_pcm_object(snd_tplg_t *tplg, struct tplg_object *object) {
 
 	tplg_dbg(" PCM: %s ID: %d dai_name: %s", pcm->pcm_name, pcm->dai_id, pcm->dai_name);
 
-	return 0;
-}
-
-static int tplg_build_data_object(snd_tplg_t *tplg, struct tplg_object *object) {
-	struct tplg_elem *elem;
-	struct tplg_attribute *bytes, *name;
-	int ret;
-
-	name = tplg_get_attribute_by_name(&object->attribute_list, "name");
-
-	elem = tplg_elem_lookup(&tplg->pdata_list, name->value.string,
-				SND_TPLG_TYPE_DATA, SND_TPLG_INDEX_ALL);
-	if(!elem)
-		return 0;
-
-	SNDERR("ranjani found data elem");
-
-	bytes = tplg_get_attribute_by_name(&object->attribute_list, "bytes");
-	if (!bytes || !bytes->cfg)
-		return 0;
-
-	ret = tplg_parse_data_hex(bytes->cfg, elem, 1);
-	if (ret < 0) {
-		SNDERR("failed to parse SOF_ABI bytes");
-		return ret;
-	}
-
-	return 0;
+	return tplg_build_private_data(tplg, object);
 }
 
 static int tplg_build_manifest_object(snd_tplg_t *tplg, struct tplg_object *object) {
 	struct snd_soc_tplg_manifest *manifest;
-	struct tplg_elem *elem, *m_elem;
-	struct tplg_attribute *name;
+	struct tplg_elem *m_elem;
+	struct list_head *pos;
 	int ret;
 
 	if (!list_empty(&tplg->manifest_list)) {
 		SNDERR("Manifest data already exists");
 		return -EINVAL;
 	}
-
-	name = tplg_get_attribute_by_name(&object->attribute_list, "name");
 
 	m_elem = tplg_elem_new_common(tplg, NULL, object->name, SND_TPLG_TYPE_MANIFEST);
 	if (!m_elem)
@@ -2702,21 +2897,67 @@ static int tplg_build_manifest_object(snd_tplg_t *tplg, struct tplg_object *obje
 	manifest = m_elem->manifest;
 	manifest->size = m_elem->size;
 
-	/* create data elem for manifest */
-	elem = tplg_elem_new_common(tplg, NULL, name->value.string, SND_TPLG_TYPE_DATA);
-        if (!elem)
-                return -ENOMEM;
+	list_for_each(pos, &object->object_list) {
+		struct tplg_object *child = list_entry(pos, struct tplg_object, list);
 
-	ret = tplg_ref_add(m_elem, SND_TPLG_TYPE_DATA, elem->id);
-	if (ret < 0) {
-		SNDERR("failed to add data elem %s to manifest elem %s\n", elem->id,
-		       m_elem->id);
-		return ret;
+		if (!object->cfg)
+			continue;
+
+		if (!strcmp(child->class_name, "data")) {
+			struct tplg_attribute *name;
+
+			name = tplg_get_attribute_by_name(&object->attribute_list, "name");
+
+			ret = tplg_ref_add(m_elem, SND_TPLG_TYPE_DATA, name->value.string);
+			if (ret < 0) {
+				SNDERR("failed to add data elem %s to manifest elem %s\n",
+				       name->value.string, m_elem->id);
+				return ret;
+			}
+		}
 	}
 
 	tplg_dbg(" Manifest: %s", m_elem->id);
 	
 	return 0;
+}
+
+static int tplg_build_data_object(snd_tplg_t *tplg, struct tplg_object *object) {
+	struct tplg_attribute *bytes, *name;
+	struct tplg_elem *data_elem;
+	int ret;
+
+	name = tplg_get_attribute_by_name(&object->attribute_list, "name");
+	if (!name) {
+		SNDERR("invalid name for data object: %s", object->name);
+		return -EINVAL;
+	}
+
+	/* check if data elem exists already */
+	data_elem = tplg_elem_lookup(&tplg->widget_list, name->value.string,
+				      SND_TPLG_TYPE_DATA, SND_TPLG_INDEX_ALL);
+	if (!data_elem) {
+		/* create data elem for byte control */
+		data_elem = tplg_elem_new_common(tplg, NULL, name->value.string,
+						 SND_TPLG_TYPE_DATA);
+	        if (!data_elem) {
+			SNDERR("failed to create data elem for %s\n", object->name);
+	                return -EINVAL;	
+		}
+	}
+
+	bytes = tplg_get_attribute_by_name(&object->attribute_list, "bytes");
+
+	if (!bytes || !bytes->cfg)
+		return 0;
+
+	ret = tplg_parse_data_hex(bytes->cfg, data_elem, 1);
+	if (ret < 0)
+		SNDERR("failed to parse byte for data: %s", object->name);
+
+	tplg_dbg("data: %s", name->value.string);
+
+	return ret;
 }
 
 
@@ -2887,7 +3128,7 @@ static int tplg_define_class_base(snd_tplg_t *tplg, snd_config_t *cfg, int type)
 			continue;
 		}
 
-		/* parse attributes */
+		/* parse attribute constraints */
 		if (!strcmp(id, "attributes")) {
 			ret = tplg_parse_class_attribute_categories(n, class);
 			if (ret < 0) {
@@ -2897,7 +3138,7 @@ static int tplg_define_class_base(snd_tplg_t *tplg, snd_config_t *cfg, int type)
 			continue;
 		}
 
-		/* check if it is an object */
+		/* parse objects */
 		class_elem = tplg_elem_lookup(&tplg->class_list, id,
 					      SND_TPLG_TYPE_CLASS, SND_TPLG_INDEX_ALL);
 		/* create object */
@@ -2916,6 +3157,16 @@ static int tplg_define_class_base(snd_tplg_t *tplg, snd_config_t *cfg, int type)
 		if (ret < 0) {
 			SNDERR("failed to parse attribute value for class %s\n", class->name);
 			return -EINVAL;
+		}
+
+		/* parse reference objects. These will be created when the type is known */
+		if (id[0] == '$') {
+			struct tplg_object *ref_object = calloc(1, sizeof(*ref_object));
+
+			if (!ref_object)
+				return -ENOMEM;
+			ref_object->cfg = n;
+			list_add(&ref_object->list, &class->ref_object_list);
 		}
 	}
 
@@ -2979,8 +3230,10 @@ int tplg_create_new_object(snd_tplg_t *tplg, snd_config_t *cfg, struct tplg_elem
 		}
 
 		ret = tplg_build_object(tplg, object);
-		if (ret < 0)
+		if (ret < 0) {
 			SNDERR("Error creating object for class %s\n", class->name);
+			return -EINVAL;
+		}
 	}
 
 	return 0;
