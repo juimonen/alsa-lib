@@ -637,6 +637,64 @@ int tplg_save_control_bytes(snd_tplg_t *tplg ATTRIBUTE_UNUSED,
 	return err;
 }
 
+int tplg_parse_control_enum_param(snd_tplg_t *tplg, snd_config_t *n,
+				  struct snd_soc_tplg_enum_control *ec,
+				  struct tplg_elem *elem)
+{
+	const char *id, *val = NULL;
+	int err;
+
+	if (snd_config_get_id(n, &id) < 0)
+		return 0;
+
+	/* skip comments */
+	if (strcmp(id, "comment") == 0)
+		return 0;
+	if (id[0] == '#')
+		return 0;
+
+	if (strcmp(id, "texts") == 0) {
+		if (snd_config_get_string(n, &val) < 0)
+			return -EINVAL;
+
+		tplg_ref_add(elem, SND_TPLG_TYPE_TEXT, val);
+		tplg_dbg("\t%s: %s", id, val);
+		return 0;
+	}
+
+	if (strcmp(id, "channel") == 0) {
+		if (ec->num_channels >= SND_SOC_TPLG_MAX_CHAN) {
+			SNDERR("too many channels %s", elem->id);
+			return -EINVAL;
+		}
+
+		err = tplg_parse_compound(tplg, n, tplg_parse_channel,
+					  ec->channel);
+		if (err < 0)
+			return err;
+
+		ec->num_channels = tplg->channel_idx;
+		return 0;
+	}
+
+	if (strcmp(id, "ops") == 0) {
+		err = tplg_parse_compound(tplg, n, tplg_parse_ops,
+					  &ec->hdr);
+		if (err < 0)
+			return err;
+		return 0;
+	}
+
+	if (strcmp(id, "data") == 0) {
+		err = tplg_parse_refs(n, elem, SND_TPLG_TYPE_DATA);
+		if (err < 0)
+			return err;
+		return 0;
+	}
+
+	return 0;
+}
+
 /* Parse Control Enums. */
 int tplg_parse_control_enum(snd_tplg_t *tplg, snd_config_t *cfg,
 			    void *private ATTRIBUTE_UNUSED)
@@ -645,7 +703,7 @@ int tplg_parse_control_enum(snd_tplg_t *tplg, snd_config_t *cfg,
 	struct tplg_elem *elem;
 	snd_config_iterator_t i, next;
 	snd_config_t *n;
-	const char *id, *val = NULL;
+	const char *id = NULL;
 	int err, j;
 	bool access_set = false;
 
@@ -667,57 +725,21 @@ int tplg_parse_control_enum(snd_tplg_t *tplg, snd_config_t *cfg,
 	tplg_dbg(" Control Enum: %s", elem->id);
 
 	snd_config_for_each(i, next, cfg) {
+		n = snd_config_iterator_entry(i);
+		err = tplg_parse_control_enum_param(tplg, n, ec, elem);
+		if (err < 0)
+			return err;
+	}
 
+	/* check if access/tlv are set. No need to check for error or parse these again */
+	snd_config_for_each(i, next, cfg) {
 		n = snd_config_iterator_entry(i);
 		if (snd_config_get_id(n, &id) < 0)
 			continue;
 
-		/* skip comments */
-		if (strcmp(id, "comment") == 0)
-			continue;
-		if (id[0] == '#')
-			continue;
-
-		if (strcmp(id, "texts") == 0) {
-			if (snd_config_get_string(n, &val) < 0)
-				return -EINVAL;
-
-			tplg_ref_add(elem, SND_TPLG_TYPE_TEXT, val);
-			tplg_dbg("\t%s: %s", id, val);
-			continue;
-		}
-
-		if (strcmp(id, "channel") == 0) {
-			if (ec->num_channels >= SND_SOC_TPLG_MAX_CHAN) {
-				SNDERR("too many channels %s", elem->id);
-				return -EINVAL;
-			}
-
-			err = tplg_parse_compound(tplg, n, tplg_parse_channel,
-				ec->channel);
-			if (err < 0)
-				return err;
-
-			ec->num_channels = tplg->channel_idx;
-			continue;
-		}
-
-		if (strcmp(id, "ops") == 0) {
-			err = tplg_parse_compound(tplg, n, tplg_parse_ops,
-				&ec->hdr);
-			if (err < 0)
-				return err;
-			continue;
-		}
-
-		if (strcmp(id, "data") == 0) {
-			err = tplg_parse_refs(n, elem, SND_TPLG_TYPE_DATA);
-			if (err < 0)
-				return err;
-			continue;
-		}
-
 		if (strcmp(id, "access") == 0) {
+			if (!cfg)
+				return 0;
 			err = parse_access(cfg, &ec->hdr);
 			if (err < 0)
 				return err;

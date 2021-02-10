@@ -2164,6 +2164,171 @@ static struct tplg_elem *tplg_build_comp_bytes(snd_tplg_t *tplg, struct tplg_obj
 	return elem;
 }
 
+static int tplg2_parse_text_values(snd_config_t *cfg, struct tplg_elem *elem)
+{
+	struct tplg_texts *texts = elem->texts;
+	snd_config_iterator_t i, next;
+	snd_config_t *n;
+	const char *value = NULL;
+	int j = 0;
+
+	tplg_dbg(" Text Values: %s", elem->id);
+
+	snd_config_for_each(i, next, cfg) {
+		n = snd_config_iterator_entry(i);
+
+		if (j == SND_SOC_TPLG_NUM_TEXTS) {
+			tplg_dbg("text string number exceeds %d", j);
+			return -ENOMEM;
+		}
+
+		/* get value */
+		if (snd_config_get_string(n, &value) < 0)
+			continue;
+
+		snd_strlcpy(&texts->items[j][0], value,
+			    SNDRV_CTL_ELEM_ID_NAME_MAXLEN);
+		tplg_dbg("\t%s", &texts->items[j][0]);
+
+		j++;
+	}
+
+	texts->num_items = j;
+	return 0;
+}
+
+static int tplg_build_text_object(snd_tplg_t *tplg, struct tplg_object *object,
+				  struct tplg_elem *m_elem) {
+	struct tplg_attribute *values;
+	struct tplg_elem *elem;
+	int ret;
+
+	values = tplg_get_attribute_by_name(&object->attribute_list, "values");
+
+	if (!values || !values->cfg)
+		return 0;
+
+	elem = tplg_elem_new_common(tplg, NULL, object->name, SND_TPLG_TYPE_TEXT);
+	if (!elem)
+		return -ENOMEM;
+
+	ret = tplg2_parse_text_values(values->cfg, elem);
+	if (ret < 0) {
+		SNDERR("failed to parse text items");
+		return ret;
+	}
+
+	ret = tplg_ref_add(m_elem, SND_TPLG_TYPE_TEXT, elem->id);
+
+	tplg_dbg("Text: %s", m_elem->id);
+
+	return 0;
+}
+
+static struct tplg_elem *tplg_build_comp_enum(snd_tplg_t *tplg, struct tplg_object *object)
+{
+	struct snd_soc_tplg_enum_control *ec;
+	struct snd_soc_tplg_ctl_hdr *hdr;
+	struct tplg_elem *elem;
+	struct list_head *pos;
+	bool access_set = false, tlv_set = false;
+	int j, ret;
+
+	elem = tplg_elem_new_common(tplg, NULL, object->name, SND_TPLG_TYPE_ENUM);
+	if (!elem)
+		return NULL;
+
+	/* init new mixer */
+	ec = elem->enum_ctrl;
+	snd_strlcpy(ec->hdr.name, elem->id, SNDRV_CTL_ELEM_ID_NAME_MAXLEN);
+	ec->hdr.type = SND_SOC_TPLG_TYPE_ENUM;
+	ec->size = elem->size;
+	hdr = &ec->hdr;
+
+	/* set channel reg to default state */
+	for (j = 0; j < SND_SOC_TPLG_MAX_CHAN; j++)
+		ec->channel[j].reg = -1;
+
+	tplg_dbg("Enum: %s", elem->id);
+
+	/* parse some control params from attributes */
+	list_for_each(pos, &object->attribute_list) {
+		struct tplg_attribute *attr;
+
+		attr = list_entry(pos, struct tplg_attribute, list);
+
+		if (!attr->cfg)
+			continue;
+
+		ret = tplg_parse_control_enum_param(tplg, attr->cfg, ec, elem);
+		if (ret < 0) {
+			SNDERR("Error parsing control enum params for %s\n", object->name);
+			return NULL;
+		}
+
+		if (!strcmp(attr->name, "access")) {
+			ret = parse_access_values(attr->cfg, &ec->hdr);
+			if (ret < 0) {
+				SNDERR("Error parsing access attribute for %s\n", object->name);
+				return NULL;
+			} else  {
+				access_set = true;
+			}
+		}
+
+	}
+
+	/* parse the rest from child objects */
+	list_for_each(pos, &object->object_list) {
+		struct tplg_object *child = list_entry(pos, struct tplg_object, list);
+
+		if (!object->cfg)
+			continue;
+
+		if (!strcmp(child->class_name, "ops")) {
+			ret = tplg_parse_ops(tplg, child->cfg, &ec->hdr);
+			if (ret < 0) {
+				SNDERR("Error parsing ops for enum %s\n", object->name);
+				return NULL;
+			}
+			continue;
+		}
+
+		if (!strcmp(child->class_name, "channel")) {
+			ret = tplg2_parse_channel(child, elem);
+			if (ret < 0) {
+				SNDERR("Error parsing channel %d for enum %s\n", child->name,
+				       object->name);
+				return NULL;
+			}
+			continue;
+		}
+
+		if (!strcmp(child->class_name, "text")) {
+			ret = tplg_build_text_object(tplg, child, elem);
+			if (ret < 0) {
+				SNDERR("Error parsing text for enum %s\n", object->name);
+				return NULL;
+			} else {
+				tlv_set = true;
+			}
+			continue;
+		}
+	}
+
+
+	tplg_dbg("Ops info: %d get: %d put: %d", hdr->ops.info, hdr->ops.get, hdr->ops.put);
+
+	/* set CTL access to default values if none are provided */
+	if (!access_set) {
+		ec->hdr.access = SNDRV_CTL_ELEM_ACCESS_READWRITE;
+		if (tlv_set)
+			ec->hdr.access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ;
+	}
+
+	return elem;
+}
+
 static int tplg_build_comp_object(snd_tplg_t *tplg, struct tplg_object *object)
 {
 	struct tplg_attribute *pipeline_id;
@@ -2251,6 +2416,21 @@ static int tplg_build_comp_object(snd_tplg_t *tplg, struct tplg_object *object)
 			ret = tplg_ref_add(w_elem, SND_TPLG_TYPE_BYTES, elem->id);
 			if (ret < 0) {
 				SNDERR("failed to add bytes control elem %s to widget elem %s\n",
+				       elem->id, w_elem->id);
+				return ret;
+			}
+		}
+
+		if (!strcmp(class_name, "enum")) {
+			elem = tplg_build_comp_enum(tplg, child);
+			if (!elem) {
+				SNDERR("Failed to build enum control for %s\n", object->name);
+				return -EINVAL;
+			}
+
+			ret = tplg_ref_add(w_elem, SND_TPLG_TYPE_ENUM, elem->id);
+			if (ret < 0) {
+				SNDERR("failed to add enum elem %s to widget elem %s\n",
 				       elem->id, w_elem->id);
 				return ret;
 			}

@@ -485,6 +485,9 @@ int tplg_parse_control_mixer_param(snd_tplg_t *tplg, snd_config_t *n,
 int tplg_parse_control_bytes_param(snd_tplg_t *tplg, snd_config_t *n,
 				    struct snd_soc_tplg_bytes_control *be,
 				    struct tplg_elem *elem);
+int tplg_parse_control_enum_param(snd_tplg_t *tplg, snd_config_t *n,
+				  struct snd_soc_tplg_enum_control *ec,
+				  struct tplg_elem *elem);
 int parse_access_values(snd_config_t *cfg, struct snd_soc_tplg_ctl_hdr *hdr);
 int tplg_parse_stream_caps_param(snd_config_t *n, struct snd_soc_tplg_stream_caps *sc);
 int tplg_parse_pcm_param(snd_tplg_t *tplg, snd_config_t *n, struct tplg_elem *elem);
